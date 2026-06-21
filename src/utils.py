@@ -8,6 +8,7 @@ import json
 from typing import Dict, Any, Optional
 from pathlib import Path
 from dotenv import load_dotenv
+from langchain_core.messages import AIMessage
 
 load_dotenv()
 
@@ -182,7 +183,7 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.0):
         temperature: Temperatura para geração (padrão: 0.0 para determinístico)
 
     Returns:
-        Instância de ChatOpenAI ou ChatGoogleGenerativeAI
+        Instância compatível com LangChain para OpenAI ou Google GenAI
 
     Raises:
         ValueError: Se provider não for suportado ou API key não configurada
@@ -207,7 +208,9 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.0):
         )
 
     elif provider == 'google':
-        from langchain_google_genai import ChatGoogleGenerativeAI
+        from google import genai
+        from google.genai import types
+        from langchain_core.runnables import RunnableLambda
 
         api_key = os.getenv('GOOGLE_API_KEY')
         if not api_key:
@@ -216,11 +219,51 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.0):
                 "Obtenha uma chave em: https://aistudio.google.com/app/apikey"
             )
 
-        return ChatGoogleGenerativeAI(
-            model=model_name,
-            temperature=temperature,
-            google_api_key=api_key
-        )
+        client = genai.Client(api_key=api_key)
+
+        def invoke_google_genai(input_data):
+            system_instruction = None
+            user_parts = []
+
+            if hasattr(input_data, "to_messages"):
+                messages = input_data.to_messages()
+            elif isinstance(input_data, list):
+                messages = input_data
+            elif isinstance(input_data, str):
+                messages = [type("TextMessage", (), {"content": input_data})()]
+            else:
+                messages = [type("TextMessage", (), {"content": str(input_data)})()]
+
+            for message in messages:
+                message_type = getattr(message, "type", message.__class__.__name__.lower())
+                content = getattr(message, "content", "")
+
+                if isinstance(content, list):
+                    content = "\n".join(str(part) for part in content)
+                elif not isinstance(content, str):
+                    content = str(content)
+
+                if "system" in message_type and content and system_instruction is None:
+                    system_instruction = content
+                elif content:
+                    user_parts.append(content)
+
+            contents = "\n\n".join(user_parts).strip()
+            if not contents:
+                contents = ""
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    temperature=temperature,
+                    system_instruction=system_instruction,
+                ),
+            )
+
+            return AIMessage(content=response.text or "")
+
+        return RunnableLambda(invoke_google_genai)
 
     else:
         raise ValueError(

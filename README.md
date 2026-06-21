@@ -78,7 +78,7 @@ from langchain import hub  # Pull e Push de prompts
 from langsmith import Client  # Interação com LangSmith API
 from langsmith.evaluation import evaluate  # Avaliação de prompts
 from langchain_openai import ChatOpenAI  # LLM OpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI  # LLM Gemini
+from google import genai  # SDK atual do Gemini
 ```
 
 ---
