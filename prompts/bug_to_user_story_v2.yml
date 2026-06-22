@@ -1050,3 +1050,6 @@ bug_to_user_story_v2:
   techniques_applied:
     - "few-shot-learning"
     - "role-prompting"
+    - "chain-of-thought"
+    - "Skeleton-templates"
+    - "Least-to-most decomposition"
