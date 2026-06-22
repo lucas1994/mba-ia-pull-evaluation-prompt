@@ -11,6 +11,7 @@ SIMPLIFICADO: Código mais limpo e direto ao ponto.
 """
 
 import os
+import re
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
@@ -19,6 +20,16 @@ from langchain_core.prompts import ChatPromptTemplate
 from utils import load_yaml, check_env_vars, print_section_header
 
 load_dotenv()
+
+
+def escape_unexpected_template_variables(text: str, allowed_variables: set[str]) -> str:
+    def replace(match):
+        variable = match.group(1)
+        if variable in allowed_variables:
+            return match.group(0)
+        return "{{" + variable + "}}"
+
+    return re.sub(r"(?<!\{)\{([a-zA-Z_][a-zA-Z0-9_]*)\}(?!\})", replace, text)
 
 
 def push_prompt_to_langsmith(prompt_name: str, prompt_data: dict) -> bool:
@@ -33,9 +44,19 @@ def push_prompt_to_langsmith(prompt_name: str, prompt_data: dict) -> bool:
         True se sucesso, False caso contrário
     """
     try:
+        allowed_variables = {"bug_report"}
+        system_prompt = escape_unexpected_template_variables(
+            prompt_data["system_prompt"].strip(),
+            allowed_variables,
+        )
+        user_prompt = escape_unexpected_template_variables(
+            prompt_data.get("user_prompt", "{bug_report}").strip(),
+            allowed_variables,
+        )
+
         messages = [
-            ("system", prompt_data["system_prompt"].strip()),
-            ("human", prompt_data.get("user_prompt", "{bug_report}").strip()),
+            ("system", system_prompt),
+            ("human", user_prompt),
         ]
         prompt_template = ChatPromptTemplate.from_messages(messages)
 

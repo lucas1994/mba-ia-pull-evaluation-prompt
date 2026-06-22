@@ -20,6 +20,7 @@ Configure o provider no arquivo .env através da variável LLM_PROVIDER.
 import os
 import sys
 import json
+from urllib.parse import quote
 from typing import List, Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
@@ -182,51 +183,121 @@ def evaluate_prompt(
     prompt_name: str,
     dataset_name: str,
     client: Client
-) -> Dict[str, float]:
+) -> tuple[Dict[str, float], str]:
     print(f"\n🔍 Avaliando: {prompt_name}")
 
     try:
         prompt_template = pull_prompt_from_langsmith(prompt_name)
-
-        examples = list(client.list_examples(dataset_name=dataset_name))
-        print(f"   Dataset: {len(examples)} exemplos")
-
         llm = get_llm()
+        chain = prompt_template | llm
 
-        f1_scores = []
-        clarity_scores = []
-        precision_scores = []
+        def predict(inputs: Dict[str, Any]) -> Dict[str, str]:
+            prompt_inputs = dict(inputs)
+            for variable in getattr(prompt_template, "input_variables", []):
+                prompt_inputs.setdefault(variable, f"{{{variable}}}")
 
-        print("   Avaliando exemplos...")
+            response = chain.invoke(prompt_inputs)
+            return {"answer": response.content}
 
-        for i, example in enumerate(examples, 1):
-            result = evaluate_prompt_on_example(prompt_template, example, llm)
+        def evaluate_all_metrics(
+            inputs: Dict[str, Any],
+            outputs: Dict[str, Any],
+            reference_outputs: Dict[str, Any],
+        ) -> list[dict]:
+            answer = outputs.get("answer", "")
+            reference = reference_outputs.get("reference", "")
+            question = inputs.get("question", inputs.get("bug_report", inputs.get("pr_title", "N/A")))
 
-            if result["answer"]:
-                f1 = evaluate_f1_score(result["question"], result["answer"], result["reference"])
-                clarity = evaluate_clarity(result["question"], result["answer"], result["reference"])
-                precision = evaluate_precision(result["question"], result["answer"], result["reference"])
+            f1 = evaluate_f1_score(question, answer, reference)
+            clarity = evaluate_clarity(question, answer, reference)
+            precision = evaluate_precision(question, answer, reference)
 
-                f1_scores.append(f1["score"])
-                clarity_scores.append(clarity["score"])
-                precision_scores.append(precision["score"])
+            helpfulness = round((clarity["score"] + precision["score"]) / 2, 4)
+            correctness = round((f1["score"] + precision["score"]) / 2, 4)
 
-                print(f"      [{i}/{len(examples)}] F1:{f1['score']:.2f} Clarity:{clarity['score']:.2f} Precision:{precision['score']:.2f}")
+            return [
+                {
+                    "key": "helpfulness",
+                    "score": helpfulness,
+                    "comment": "Metrica derivada da media entre clarity e precision.",
+                },
+                {
+                    "key": "correctness",
+                    "score": correctness,
+                    "comment": "Metrica derivada da media entre f1_score e precision.",
+                },
+                {
+                    "key": "f1_score",
+                    "score": f1["score"],
+                    "comment": f1.get("reasoning", ""),
+                },
+                {
+                    "key": "clarity",
+                    "score": clarity["score"],
+                    "comment": clarity.get("reasoning", ""),
+                },
+                {
+                    "key": "precision",
+                    "score": precision["score"],
+                    "comment": precision.get("reasoning", ""),
+                },
+            ]
 
-        avg_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
-        avg_clarity = sum(clarity_scores) / len(clarity_scores) if clarity_scores else 0.0
-        avg_precision = sum(precision_scores) / len(precision_scores) if precision_scores else 0.0
+        print("   Criando experimento no LangSmith...")
+        results = client.evaluate(
+            predict,
+            data=dataset_name,
+            evaluators=[evaluate_all_metrics],
+            experiment_prefix=prompt_name.replace("/", "-"),
+            description=f"Avaliacao automatica do prompt {prompt_name}",
+            metadata={
+                "prompt": prompt_name,
+                "dataset": dataset_name,
+                "llm_provider": os.getenv("LLM_PROVIDER", "openai"),
+                "llm_model": os.getenv("LLM_MODEL", "gpt-4o-mini"),
+                "eval_model": os.getenv("EVAL_MODEL", "gpt-4o"),
+            },
+            max_concurrency=0,
+            blocking=True,
+        )
 
-        avg_helpfulness = (avg_clarity + avg_precision) / 2
-        avg_correctness = (avg_f1 + avg_precision) / 2
+        score_values: Dict[str, list[float]] = {
+            "helpfulness": [],
+            "correctness": [],
+            "f1_score": [],
+            "clarity": [],
+            "precision": [],
+        }
+
+        row_count = 0
+        for row_count, row in enumerate(results, 1):
+            evaluation_results = row.get("evaluation_results", {})
+            for evaluation in evaluation_results.get("results", []):
+                if isinstance(evaluation, dict):
+                    key = evaluation.get("key")
+                    score = evaluation.get("score")
+                else:
+                    key = getattr(evaluation, "key", None)
+                    score = getattr(evaluation, "score", None)
+
+                if key in score_values and score is not None:
+                    score_values[key].append(float(score))
+
+        print(f"   ✓ Experimento criado: {results.experiment_name}")
+        print(f"   ✓ Exemplos avaliados: {row_count}")
+        print(f"   ✓ Tabela: https://smith.langchain.com/projects/{quote(results.experiment_name)}")
+
+        def average(metric_name: str) -> float:
+            values = score_values[metric_name]
+            return round(sum(values) / len(values), 4) if values else 0.0
 
         return {
-            "helpfulness": round(avg_helpfulness, 4),
-            "correctness": round(avg_correctness, 4),
-            "f1_score": round(avg_f1, 4),
-            "clarity": round(avg_clarity, 4),
-            "precision": round(avg_precision, 4)
-        }
+            "helpfulness": average("helpfulness"),
+            "correctness": average("correctness"),
+            "f1_score": average("f1_score"),
+            "clarity": average("clarity"),
+            "precision": average("precision")
+        }, results.experiment_name
 
     except Exception as e:
         print(f"   ❌ Erro na avaliação: {e}")
@@ -236,7 +307,7 @@ def evaluate_prompt(
             "f1_score": 0.0,
             "clarity": 0.0,
             "precision": 0.0
-        }
+        }, ""
 
 
 def display_results(prompt_name: str, scores: Dict[str, float]) -> bool:
@@ -332,7 +403,7 @@ def main():
         evaluated_count += 1
 
         try:
-            scores = evaluate_prompt(prompt_name, dataset_name, client)
+            scores, experiment_name = evaluate_prompt(prompt_name, dataset_name, client)
 
             passed = display_results(prompt_name, scores)
             all_passed = all_passed and passed
@@ -340,6 +411,7 @@ def main():
             results_summary.append({
                 "prompt": prompt_name,
                 "scores": scores,
+                "experiment_name": experiment_name,
                 "passed": passed
             })
 
@@ -356,6 +428,7 @@ def main():
                     "clarity": 0.0,
                     "precision": 0.0
                 },
+                "experiment_name": "",
                 "passed": False
             })
 
@@ -371,10 +444,15 @@ def main():
     print(f"Aprovados: {sum(1 for r in results_summary if r['passed'])}")
     print(f"Reprovados: {sum(1 for r in results_summary if not r['passed'])}\n")
 
+    experiment_names = [r["experiment_name"] for r in results_summary if r.get("experiment_name")]
+    if experiment_names:
+        print("Experimentos LangSmith:")
+        for experiment_name in experiment_names:
+            print(f"  - {experiment_name}: https://smith.langchain.com/projects/{quote(experiment_name)}")
+        print()
+
     if all_passed:
         print("✅ Todos os prompts atingiram todas as métricas >= 0.9!")
-        print(f"\n✓ Confira os resultados em:")
-        print(f"  https://smith.langchain.com/projects/{project_name}")
         print("\nPróximos passos:")
         print("1. Documente o processo no README.md")
         print("2. Capture screenshots das avaliações")
